@@ -75,9 +75,12 @@ export class MetaAgentService {
   }
 
   async generatePlan(task: string, priority: Priority = Priority.MEDIUM, previousEvaluation?: Evaluation, previousAgents?: Agent[], suggestedTools?: string[]): Promise<Plan> {
-    console.log(`Generating optimized plan for task: "${task}" with priority: ${priority}`);
+    console.log(`Generating plan for task: "${task}" with priority: ${priority}`);
+    if (previousEvaluation) {
+      console.log("Incorporating previous evaluation feedback into planning...");
+    }
     
-    const timeout = 60000; // Reduced timeout to 60s for faster feedback
+    const timeout = 120000; // 120 seconds timeout
     const timeoutPromise = new Promise<never>((_, reject) => 
       setTimeout(() => reject(new Error("Architect is taking too long to design the system. Please try again.")), timeout)
     );
@@ -94,23 +97,148 @@ export class MetaAgentService {
 
     try {
       const responsePromise = this.withRetry(() => ai.models.generateContent({
-        model: this.flashModel, // Switched to Flash for speed
-        contents: `You are a Meta-System Architect. Design a custom multi-agent system to solve: "${task}".
+        model: this.model,
+        contents: `You are a Meta-System Architect. Your task is to design a custom multi-agent system (a "mini-system") specifically tailored to solve this user request: "${task}".
         Task Priority: ${priority}
         ${skillsContext}
         ${toolsContext}
+        1. Name the system (e.g., "News-Insight-Engine", "Stock-Predictor-V1").
+        2. Describe the system's architecture.
+        3. Decide on the complexity and number of agents based on the guide.
+        
+        4. **Reasoning & Strategy**: Provide a detailed justification for this specific architecture. 
+           - Analyze the task's core requirements.
+           - Identify potential bottlenecks or challenges.
+           - Explicitly consider potential agent conflicts or overlaps and how your design mitigates them.
+           - Justify why these specific agents were chosen and how their roles complement each other.
+           - Explain the choice of complexity level.
+           - **Tool Strategy**: Reason about the types of tools needed (e.g., Search, Data Analysis, Code Execution, Creative Writing, API Integration).
+           - **IMPORTANT**: This detailed reasoning MUST be included in the 'reasoning' field of the JSON response.
+        
+        5. **Agent Types & Selection**: Define the agents. Each agent must be specialized. 
+           - **EXECUTOR Agent**: Include an 'EXECUTOR' agent type when the task involves executing code, performing calculations, or interacting with external systems/APIs. 
+           - **Role**: Action Execution & Task Completion.
+           - **Objective**: Execute provided code snippets, perform API calls, or modify state based on task requirements.
+           - **Expected Output**: Execution results, status reports, or data returned from external systems in a structured format.
+           - **Tools**: Assign appropriate tools like 'Python/Node.js execution environment', 'API interaction libraries', or 'System command utilities'.
+           - Ensure its dependencies and load are correctly configured according to the AGENT BUILDING SKILLS GUIDE.
+           - Ensure the "expectedOutput" for each agent is clear and specifies a structured format (e.g., Markdown table, list, or JSON snippet) to ensure reliability.
+        
+        6. **Dynamic Tool Discovery & Assignment**:
+           - For each agent, proactively discover and suggest a set of relevant tools.
+           - **Reference the "TOOL MAPPING" section in the AGENT BUILDING SKILLS GUIDE** to identify appropriate tool categories for each agent type (e.g., PLANNER, DATA_FETCHER, ANALYZER).
+           - Incorporate any "USER-SUGGESTED TOOLS" if they align with the agent's specialized role.
+           - **Propose specific, high-value tools** (e.g., "Python/Pandas for data frame manipulation", "Google Search Grounding for current events", "Recharts for JSON-to-Chart logic", "NLP Sentiment Analysis libraries").
+           - Ensure the tools are listed in the 'tools' array for each agent.
+           - In your 'reasoning', explain the logic behind the tool selection for the overall system.
+        
+        7. **Agent Dependencies**: Define explicit dependencies between agents. Some agents may need to complete their tasks before others can start. Specify these dependencies using agent IDs (e.g., agent 'A' must complete before agent 'B' can start). This will allow for a Directed Acyclic Graph (DAG) execution strategy.
+        
+        ${previousEvaluation ? `PREVIOUS EVALUATION FEEDBACK (LEARN FROM THIS):
+        Score: ${previousEvaluation.score}/10
+        Feedback: ${previousEvaluation.feedback}
+        Please adjust the system architecture and agent objectives to address this feedback.` : ""}
 
-        INSTRUCTIONS:
-        1. Name the system and describe its architecture.
-        2. Define specialized agents with clear objectives and structured expected outputs.
-        3. **PROACTIVE TOOL DISCOVERY**: Use Google Search to find specific, real-world tools, APIs, or libraries for each agent.
-        4. Define agent dependencies (DAG).
-        5. Provide a detailed reasoning for this specific architecture.
+        ${agentLearnings ? `AGENT SELF-LEARNINGS FROM PREVIOUS ATTEMPT:
+        ${agentLearnings}
+        Use these specific agent insights to improve the next system design.` : ""}
 
-        ${previousEvaluation ? `PREVIOUS EVALUATION FEEDBACK: ${previousEvaluation.feedback}` : ""}
-        ${agentLearnings ? `AGENT SELF-LEARNINGS: ${agentLearnings}` : ""}`,
+        The priority "${priority}" should influence the depth of research, the number of agents (higher priority might need more specialized agents), and the overall thoroughness of the design.`,
         config: {
-          systemInstruction: "You are a Meta-System Architect. Design a multi-agent system in strictly valid JSON. Use Google Search to proactively discover the best tools for each agent role. Ensure high quality and structural precision.",
+          systemInstruction: "You are a Meta-System Architect. Your task is to design a custom multi-agent system (a 'mini-system') specifically tailored to solve a user request. You must return your design in a strictly valid JSON format following the provided schema. Ensure each agent has a clear role, a structured 'expectedOutput' format, and a list of tools they should use. The 'reasoning' field must contain a thorough justification of your design choices, including agent selection, complexity, and conflict resolution.",
+          responseMimeType: "application/json",
+          tools: [{ googleSearch: {} }],
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              systemName: { type: Type.STRING },
+              systemDescription: { type: Type.STRING },
+              complexity: { type: Type.STRING, enum: Object.values(TaskComplexity) },
+              reasoning: { type: Type.STRING },
+              agents: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    name: { type: Type.STRING },
+                    role: { type: Type.STRING },
+                    objective: { type: Type.STRING },
+                    expectedOutput: { type: Type.STRING },
+                    tools: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING }
+                    },
+                    dependencies: {
+                      type: Type.ARRAY,
+                      items: { type: Type.STRING },
+                      description: "List of agent IDs that this agent depends on."
+                    },
+                    load: {
+                      type: Type.NUMBER,
+                      description: "Load percentage (0-100) for this agent."
+                    }
+                  },
+                  required: ["id", "name", "role", "objective", "expectedOutput"],
+                },
+              },
+            },
+            required: ["systemName", "systemDescription", "complexity", "reasoning", "agents"],
+          },
+        },
+      }));
+
+      const response = await Promise.race([responsePromise, timeoutPromise]);
+
+      const text = response.text;
+      if (!text) {
+        throw new Error("Model returned an empty response during planning.");
+      }
+
+      const plan = JSON.parse(text) as Plan;
+      console.log("Initial plan generated successfully. Proceeding to tool discovery...");
+      
+      // STEP 2: PROACTIVE TOOL DISCOVERY (Optional but recommended for complex tasks)
+      // We can either do it in one call or two. Let's stick to one for now but refine the prompt.
+      // Actually, the user asked for it to be "After identifying the task and planning the agents".
+      // So let's make it a separate internal step if needed, or just ensure the architect's reasoning reflects this.
+      // Given the constraints, a single high-quality call with googleSearch is often better.
+      // But let's add a separate method for "Refining tools" if the user wants to see it.
+      
+      console.log("Plan generated successfully:", plan);
+      return plan;
+    } catch (error) {
+      console.error("Error in generatePlan:", error);
+      throw error;
+    }
+  }
+
+  async discoverTools(task: string, plan: Plan): Promise<Plan> {
+    console.log(`Proactively discovering tools for system: ${plan.systemName}`);
+    
+    try {
+      const response = await this.withRetry(() => ai.models.generateContent({
+        model: this.model,
+        contents: `You are the Meta-System Architect. You have already designed the following multi-agent system for the task: "${task}".
+        
+        SYSTEM DESIGN:
+        Name: ${plan.systemName}
+        Description: ${plan.systemDescription}
+        Agents:
+        ${plan.agents.map(a => `- ${a.name} (${a.role}): ${a.objective}`).join('\n')}
+        
+        YOUR TASK:
+        Proactively search for and suggest relevant tools that each agent can use to achieve its objective more effectively.
+        
+        GUIDELINES:
+        1. **Reference the "TOOL MAPPING" section in the AGENT BUILDING SKILLS GUIDE** (provided earlier) for categories.
+        2. **Use Google Search** to find real-world, specific tools, libraries, or APIs that fit these categories (e.g., specific Python libraries, specialized APIs, visualization frameworks).
+        3. For each agent, provide a list of 2-4 highly relevant tools.
+        4. Update the 'tools' field for each agent in the provided plan.
+        
+        Return the updated plan in JSON format.`,
+        config: {
+          systemInstruction: "You are a Meta-System Architect specialized in tool discovery. Use Google Search to find the most relevant and powerful tools for your agents. Return the updated plan in a strictly valid JSON format.",
           responseMimeType: "application/json",
           tools: [{ googleSearch: {} }],
           responseSchema: {
@@ -138,7 +266,10 @@ export class MetaAgentService {
                       type: Type.ARRAY,
                       items: { type: Type.STRING }
                     },
-                    load: { type: Type.NUMBER }
+                    load: {
+                      type: Type.NUMBER,
+                      description: "Load percentage (0-100) for this agent."
+                    }
                   },
                   required: ["id", "name", "role", "objective", "expectedOutput"],
                 },
@@ -149,27 +280,16 @@ export class MetaAgentService {
         },
       }));
 
-      const response = await Promise.race([responsePromise, timeoutPromise]);
-
       const text = response.text;
-      if (!text) {
-        throw new Error("Model returned an empty response during planning.");
-      }
-
-      const plan = JSON.parse(text) as Plan;
-      console.log("Optimized plan generated successfully.");
+      if (!text) throw new Error("Tool discovery returned empty response.");
       
-      return plan;
+      const updatedPlan = JSON.parse(text) as Plan;
+      console.log("Tools discovered and assigned successfully.");
+      return updatedPlan;
     } catch (error) {
-      console.error("Error in generatePlan:", error);
-      throw error;
+      console.error("Error in discoverTools:", error);
+      return plan; // Return original plan if discovery fails
     }
-  }
-
-  // discoverTools is now integrated into generatePlan for performance.
-  // Keeping a dummy version for compatibility if needed, but it's no longer used in App.tsx.
-  async discoverTools(task: string, plan: Plan): Promise<Plan> {
-    return plan;
   }
 
   async executeAgent(agent: Agent, task: string, previousResults: string, priority: Priority = Priority.MEDIUM, previousEvaluation?: Evaluation): Promise<string> {
@@ -301,12 +421,18 @@ export class MetaAgentService {
     }
   }
 
-  async evaluateResult(task: string, finalResult: string): Promise<Evaluation> {
+  async evaluateResult(task: string, finalResult: string, plan?: Plan): Promise<Evaluation> {
     console.log("Evaluating final result...");
     const maxResultLength = 15000;
     const truncatedResult = finalResult.length > maxResultLength 
       ? finalResult.substring(0, maxResultLength) + "... [truncated]"
       : finalResult;
+
+    const agentsContext = plan ? `
+        SYSTEM ARCHITECTURE: ${plan.systemDescription}
+        AGENTS AND THEIR OBJECTIVES:
+        ${plan.agents.map(a => `- ${a.name} (${a.role}): ${a.objective}`).join('\n')}
+    ` : "";
 
     const timeout = 60000; // 60 seconds timeout
     const timeoutPromise = new Promise<never>((_, reject) => 
@@ -316,17 +442,31 @@ export class MetaAgentService {
     try {
       const responsePromise = this.withRetry(() => ai.models.generateContent({
         model: this.flashModel,
-        contents: `You are an Evaluator AI.
-        User Task: "${task}"
-        Final System Output: "${truncatedResult}"
+        contents: `You are a Senior System Evaluator AI. Your task is to perform a rigorous quality audit of the final output generated by a multi-agent system.
+
+        USER ORIGINAL TASK: "${task}"
+        ${agentsContext}
         
-        Evaluate the output. Is it complete, accurate, and helpful?
-        Provide a score (0-10) and feedback.
-        Decide if it is satisfactory or needs improvement.
+        FINAL SYSTEM OUTPUT TO EVALUATE:
+        "${truncatedResult}"
         
+        EVALUATION CRITERIA:
+        1. **Objective Alignment**: Did the system follow the designed architecture? Did each agent's contribution (as seen in the final output) meet its specific objective?
+        2. **Completeness**: Are all parts of the user's request addressed?
+        3. **Accuracy & Technical Depth**: Is the information factually correct and sufficiently detailed for the task complexity?
+        4. **Structural Integrity**: Is the output well-formatted (Markdown, tables, etc.) and easy to consume?
+
+        SCORING RUBRIC (0-10):
+        - 0-3: CRITICAL FAILURE. Missing core components, highly inaccurate, or ignored the user task.
+        - 4-6: PARTIAL SUCCESS. Met basic requirements but lacks depth, has minor inaccuracies, or failed specific agent objectives.
+        - 7-8: HIGH QUALITY. Meets all core objectives, accurate, and well-structured.
+        - 9-10: EXCEPTIONAL. Exceeds expectations, perfect alignment with architecture, and provides deep insights.
+
+        Your feedback must be technical and constructive. If the score is below 8, explicitly state what is missing or what needs improvement for the next refinement iteration.
+
         Return in JSON format.`,
         config: {
-          systemInstruction: "You are an Evaluator AI. Your task is to objectively score and provide feedback on the final output of a multi-agent system. You must return your evaluation in a strictly valid JSON format following the provided schema.",
+          systemInstruction: "You are a Senior System Evaluator AI. Provide a rigorous, objective, and technical evaluation of the system output. Return your audit in a strictly valid JSON format.",
           responseMimeType: "application/json",
           responseSchema: {
             type: Type.OBJECT,

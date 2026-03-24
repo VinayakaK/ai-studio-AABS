@@ -56,6 +56,8 @@ export default function App() {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
   const [isStatusModalOpen, setIsStatusModalOpen] = useState(false);
   
+  const [attempts, setAttempts] = useState(0);
+  
   // Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [userInput, setUserInput] = useState('');
@@ -182,223 +184,229 @@ export default function App() {
     }
   }, [chatMessages]);
 
-  const handleStart = async () => {
+  const handleStart = async (isRetry = false) => {
     if (!task.trim()) return;
 
     setError(null);
-    setLogs([]);
-    setEvaluation(null);
-    setAgents([]);
-    setPlan(null);
-    setExecutionResults('');
-    setChatMessages([]);
     
-    let currentEvaluation: Evaluation | null = null;
-    let previousAgents: Agent[] = [];
-    let attempts = 0;
-    const maxAttempts = 2; // Allow up to 1 refinement attempt (total 2)
-
-    while (attempts < maxAttempts) {
-      try {
-        attempts++;
-        if (attempts > 1) {
-          addLog(`--- REFINEMENT ATTEMPT ${attempts} ---`);
-          addLog("System is learning from previous evaluation and agent self-reflections...");
-        }
-
-        // STEP 1, 2 & 3: Meta-System Architect & Tool Discovery
-        setCurrentStep('planning');
-        if (attempts === 1) addLog(`User Query Received: "${task}"`);
-        
-        const toolsList = suggestedTools.split(',').map(t => t.trim()).filter(t => t !== '');
-        if (toolsList.length > 0) {
-          addLog(`Suggested Tools: ${toolsList.join(', ')}`);
-        }
-        
-        addLog("Meta-System Architect is designing a custom solution & discovering tools...");
-        
-        console.log("Calling generatePlan...");
-        const generatedPlan = await metaAgentService.generatePlan(task, priority, currentEvaluation || undefined, previousAgents, toolsList);
-        console.log("Plan received:", generatedPlan);
-        
-        setPlan(generatedPlan);
-        addLog(`System Design Complete: "${generatedPlan.systemName}"`);
-        addLog(`Architecture: ${generatedPlan.systemDescription}`);
-        addLog(`Priority: ${priority}`);
-        addLog(`Complexity: ${generatedPlan.complexity}`);
-
-        // STEP 5: Builder (Actual Construction)
-        setCurrentStep('building');
-        addLog(`Building Custom System: ${generatedPlan.systemName}...`);
-        
-        for (const agent of generatedPlan.agents) {
-          console.log("Constructing agent:", agent.name);
-          addLog(`Constructing Agent: ${agent.name} (${agent.role})`);
-          addLog(`-> Injecting Objective: ${agent.objective}`);
-          await new Promise(r => setTimeout(r, 300)); // Faster simulation
-        }
-        
-        const initializedAgents = generatedPlan.agents.map(a => ({ ...a, status: 'pending' as const }));
-        setAgents(initializedAgents);
-        addLog("System construction finalized. All agents initialized and aware.");
-
-        // STEP 6: Executor (DAG-based)
-        setCurrentStep('executing');
-        addLog(`Activating ${generatedPlan.systemName} execution sequence...`);
-        
-        let results = "";
-        const currentExecutionAgents: Agent[] = initializedAgents.map(a => ({ ...a }));
-        const completedAgentIds = new Set<string>();
-        const runningAgentIds = new Set<string>();
-        const agentResults: Record<string, string> = {};
-
-        const executeDAG = async () => {
-          while (completedAgentIds.size < currentExecutionAgents.length) {
-            // Find agents that are pending and have all dependencies met
-            const readyAgents = currentExecutionAgents.filter(agent => 
-              agent.status === 'pending' && 
-              (!agent.dependencies || agent.dependencies.every(depId => completedAgentIds.has(depId))) &&
-              !runningAgentIds.has(agent.id)
-            );
-
-            if (readyAgents.length === 0 && runningAgentIds.size === 0) {
-              // This could happen if there's a circular dependency or a dead-end
-              throw new Error("Execution stalled: Circular dependencies or unmet prerequisites detected.");
-            }
-
-            if (readyAgents.length > 0) {
-              // Start all ready agents in parallel
-              readyAgents.forEach(agent => {
-                runningAgentIds.add(agent.id);
-                setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'running' } : a));
-                addLog(`[${agent.name}] is now active and processing...`);
-              });
-
-              // Map each ready agent to an execution promise
-              const executionPromises = readyAgents.map(async (agent) => {
-                try {
-                  // Construct context from dependencies
-                  let context = "";
-                  if (agent.dependencies && agent.dependencies.length > 0) {
-                    agent.dependencies.forEach(depId => {
-                      const depAgent = currentExecutionAgents.find(a => a.id === depId);
-                      if (depAgent && agentResults[depId]) {
-                        context += `\n--- Prerequisite Result from ${depAgent.name} ---\n${agentResults[depId]}\n`;
-                      }
-                    });
-                  } else {
-                    // If no explicit dependencies, provide all currently available results as a fallback
-                    // We build this from agentResults to avoid race conditions
-                    context = Object.entries(agentResults)
-                      .map(([id, res]) => {
-                        const a = currentExecutionAgents.find(ag => ag.id === id);
-                        return `\n--- Result from ${a?.name || id} ---\n${res}\n`;
-                      })
-                      .join("");
-                  }
-
-                  const result = await metaAgentService.executeAgent(agent, task, context, priority, currentEvaluation || undefined);
-                  
-                  agentResults[agent.id] = result;
-                  completedAgentIds.add(agent.id);
-                  runningAgentIds.delete(agent.id);
-                  
-                  // Update the local agent object in our tracking array
-                  const agentIdx = currentExecutionAgents.findIndex(a => a.id === agent.id);
-                  if (agentIdx !== -1) {
-                    currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'completed', result };
-                  }
-
-                  setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'completed', result } : a));
-                  addLog(`[${agent.name}] task completed successfully.`);
-                } catch (agentErr: any) {
-                  const agentIdx = currentExecutionAgents.findIndex(a => a.id === agent.id);
-                  const errorMsg = agentErr.message || "Unknown error";
-                  
-                  // Call diagnoseFailure to get detailed context
-                  const diagnosis = await metaAgentService.diagnoseFailure(agent, errorMsg, task, currentExecutionAgents);
-                  
-                  if (agentIdx !== -1) {
-                    currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'failed', failureDiagnosis: diagnosis };
-                  }
-                  setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'failed', failureDiagnosis: diagnosis } : a));
-                  addLog(`[${agent.name}] FAILED. Diagnosis generated.`);
-                  throw agentErr;
-                }
-              });
-
-              // Wait for all currently started ones to finish or fail.
-              await Promise.all(executionPromises);
-            } else {
-              // If no new agents are ready but some are running, we just wait.
-              await new Promise(r => setTimeout(r, 500));
-            }
-          }
-        };
-
-        await executeDAG();
-        
-        // Build final results string from all agents in the order they were defined in the plan
-        results = currentExecutionAgents
-          .filter(a => a.status === 'completed')
-          .map(a => `\n--- Result from ${a.name} ---\n${a.result}\n`)
-          .join("");
-        
-        setExecutionResults(results);
-
-        // STEP 7: Evaluator
-        setCurrentStep('evaluating');
-        addLog("Meta-System Evaluator is verifying the final output...");
-        console.log("Calling evaluateResult...");
-        const evalResult = await metaAgentService.evaluateResult(task, results);
-        console.log("Evaluation received:", evalResult);
-        
-        setEvaluation(evalResult);
-        currentEvaluation = evalResult;
-        addLog(`Quality Score: ${evalResult.score}/10`);
-
-        if (evalResult.isSatisfactory) {
-          addLog("Evaluation successful. Output meets quality standards.");
-          break; // Exit loop if satisfactory
-        } else if (attempts < maxAttempts) {
-          setCurrentStep('improving');
-          addLog(`Evaluation failed: ${evalResult.feedback}`);
-          addLog("Agents are reflecting on their performance...");
-          
-          const reflectingAgents = [...currentExecutionAgents];
-          for (let i = 0; i < reflectingAgents.length; i++) {
-            const agent = reflectingAgents[i];
-            addLog(`[${agent.name}] is analyzing feedback...`);
-            const learning = await metaAgentService.agentSelfReflect(agent, task, evalResult);
-            reflectingAgents[i] = { ...agent, learning_from_feedback: learning };
-            addLog(`[${agent.name}] Learning: ${learning}`);
-          }
-          previousAgents = reflectingAgents;
-          setAgents(reflectingAgents);
-
-          addLog("Triggering self-improvement loop with agent learnings...");
-          await new Promise(r => setTimeout(r, 3000));
-        } else {
-          addLog("Max refinement attempts reached. Delivering best possible output.");
-        }
-
-      } catch (err: any) {
-        console.error("Orchestration Error:", err);
-        setError(err.message || "An unexpected error occurred during orchestration.");
-        addLog(`ERROR: ${err.message || "Unknown error"}`);
-        setCurrentStep('idle');
-        return; // Exit on error
-      }
+    if (!isRetry) {
+      setLogs([]);
+      setEvaluation(null);
+      setAgents([]);
+      setPlan(null);
+      setExecutionResults('');
+      setChatMessages([]);
+      setAttempts(1);
+    } else {
+      setAttempts(prev => prev + 1);
+      addLog(`--- REFINEMENT ATTEMPT ${attempts + 1} ---`);
+      addLog("System is learning from previous evaluation and agent self-reflections...");
     }
+    
+    let currentEvaluation: Evaluation | null = isRetry ? evaluation : null;
+    let previousAgents: Agent[] = isRetry ? agents : [];
 
-    setCurrentStep('completed');
-    if (plan) {
-      addLog(`Orchestration of ${plan.systemName} finished.`);
+    try {
+      if (isRetry && currentEvaluation) {
+        setCurrentStep('improving');
+        addLog(`Evaluation feedback: ${currentEvaluation.feedback}`);
+        addLog("Agents are reflecting on their performance...");
+        
+        const reflectingAgents = [...previousAgents];
+        for (let i = 0; i < reflectingAgents.length; i++) {
+          const agent = reflectingAgents[i];
+          addLog(`[${agent.name}] is analyzing feedback...`);
+          const learning = await metaAgentService.agentSelfReflect(agent, task, currentEvaluation);
+          reflectingAgents[i] = { ...agent, learning_from_feedback: learning };
+          addLog(`[${agent.name}] Learning: ${learning}`);
+        }
+        previousAgents = reflectingAgents;
+        setAgents(reflectingAgents);
+
+        addLog("Triggering self-improvement loop with agent learnings...");
+        await new Promise(r => setTimeout(r, 2000));
+      }
+
+      // STEP 1 & 2: Meta-System Architect
+      setCurrentStep('planning');
+      if (!isRetry) addLog(`User Query Received: "${task}"`);
       
-      // Initial System Message
-      setChatMessages([
-        { role: 'model', text: `Hello! I am the interface for the **${plan.systemName}** system. I have completed the task: "${task}". How can I help you further with these results?` }
-      ]);
+      const toolsList = suggestedTools.split(',').map(t => t.trim()).filter(t => t !== '');
+      if (toolsList.length > 0 && !isRetry) {
+        addLog(`Suggested Tools: ${toolsList.join(', ')}`);
+      }
+      
+      addLog("Meta-System Architect is designing a custom solution...");
+      
+      console.log("Calling generatePlan...");
+      const generatedPlan = await metaAgentService.generatePlan(task, priority, currentEvaluation || undefined, previousAgents, toolsList);
+      console.log("Plan received:", generatedPlan);
+      
+      setPlan(generatedPlan);
+      addLog(`System Design Complete: "${generatedPlan.systemName}"`);
+      addLog(`Architecture: ${generatedPlan.systemDescription}`);
+      addLog(`Priority: ${priority}`);
+      addLog(`Complexity: ${generatedPlan.complexity}`);
+
+      // STEP 3: Proactive Tool Discovery
+      setCurrentStep('discovering');
+      addLog("Proactively searching for specialized tools based on agent roles...");
+      const planWithTools = await metaAgentService.discoverTools(task, generatedPlan);
+      setPlan(planWithTools);
+      addLog("Tool discovery complete. Specialized tools assigned to agents.");
+
+      // STEP 5: Builder (Actual Construction)
+      setCurrentStep('building');
+      addLog(`Building Custom System: ${generatedPlan.systemName}...`);
+      
+      for (const agent of generatedPlan.agents) {
+        console.log("Constructing agent:", agent.name);
+        addLog(`Constructing Agent: ${agent.name} (${agent.role})`);
+        addLog(`-> Injecting Objective: ${agent.objective}`);
+        await new Promise(r => setTimeout(r, 600)); // Simulate construction
+      }
+      
+      const initializedAgents = generatedPlan.agents.map(a => ({ ...a, status: 'pending' as const }));
+      setAgents(initializedAgents);
+      addLog("System construction finalized. All agents initialized and aware.");
+
+      // STEP 6: Executor (DAG-based)
+      setCurrentStep('executing');
+      addLog(`Activating ${generatedPlan.systemName} execution sequence...`);
+      
+      let results = "";
+      const currentExecutionAgents: Agent[] = initializedAgents.map(a => ({ ...a }));
+      const completedAgentIds = new Set<string>();
+      const runningAgentIds = new Set<string>();
+      const agentResults: Record<string, string> = {};
+
+      const executeDAG = async () => {
+        while (completedAgentIds.size < currentExecutionAgents.length) {
+          // Find agents that are pending and have all dependencies met
+          const readyAgents = currentExecutionAgents.filter(agent => 
+            agent.status === 'pending' && 
+            (!agent.dependencies || agent.dependencies.every(depId => completedAgentIds.has(depId))) &&
+            !runningAgentIds.has(agent.id)
+          );
+
+          if (readyAgents.length === 0 && runningAgentIds.size === 0) {
+            // This could happen if there's a circular dependency or a dead-end
+            throw new Error("Execution stalled: Circular dependencies or unmet prerequisites detected.");
+          }
+
+          if (readyAgents.length > 0) {
+            // Start all ready agents in parallel
+            readyAgents.forEach(agent => {
+              runningAgentIds.add(agent.id);
+              setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'running' } : a));
+              addLog(`[${agent.name}] is now active and processing...`);
+            });
+
+            // Map each ready agent to an execution promise
+            const executionPromises = readyAgents.map(async (agent) => {
+              try {
+                // Construct context from dependencies
+                let context = "";
+                if (agent.dependencies && agent.dependencies.length > 0) {
+                  agent.dependencies.forEach(depId => {
+                    const depAgent = currentExecutionAgents.find(a => a.id === depId);
+                    if (depAgent && agentResults[depId]) {
+                      context += `\n--- Prerequisite Result from ${depAgent.name} ---\n${agentResults[depId]}\n`;
+                    }
+                  });
+                } else {
+                  // If no explicit dependencies, provide all currently available results as a fallback
+                  // We build this from agentResults to avoid race conditions
+                  context = Object.entries(agentResults)
+                    .map(([id, res]) => {
+                      const a = currentExecutionAgents.find(ag => ag.id === id);
+                      return `\n--- Result from ${a?.name || id} ---\n${res}\n`;
+                    })
+                    .join("");
+                }
+
+                const result = await metaAgentService.executeAgent(agent, task, context, priority, currentEvaluation || undefined);
+                
+                agentResults[agent.id] = result;
+                completedAgentIds.add(agent.id);
+                runningAgentIds.delete(agent.id);
+                
+                // Update the local agent object in our tracking array
+                const agentIdx = currentExecutionAgents.findIndex(a => a.id === agent.id);
+                if (agentIdx !== -1) {
+                  currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'completed', result };
+                }
+
+                setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'completed', result } : a));
+                addLog(`[${agent.name}] task completed successfully.`);
+              } catch (agentErr: any) {
+                const agentIdx = currentExecutionAgents.findIndex(a => a.id === agent.id);
+                const errorMsg = agentErr.message || "Unknown error";
+                
+                // Call diagnoseFailure to get detailed context
+                const diagnosis = await metaAgentService.diagnoseFailure(agent, errorMsg, task, currentExecutionAgents);
+                
+                if (agentIdx !== -1) {
+                  currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'failed', failureDiagnosis: diagnosis };
+                }
+                setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'failed', failureDiagnosis: diagnosis } : a));
+                addLog(`[${agent.name}] FAILED. Diagnosis generated.`);
+                throw agentErr;
+              }
+            });
+
+            // Wait for all currently started ones to finish or fail.
+            await Promise.all(executionPromises);
+          } else {
+            // If no new agents are ready but some are running, we just wait.
+            await new Promise(r => setTimeout(r, 500));
+          }
+        }
+      };
+
+      await executeDAG();
+      
+      // Build final results string from all agents in the order they were defined in the plan
+      results = currentExecutionAgents
+        .filter(a => a.status === 'completed')
+        .map(a => `\n--- Result from ${a.name} ---\n${a.result}\n`)
+        .join("");
+      
+      setExecutionResults(results);
+
+      // STEP 7: Evaluator
+      setCurrentStep('evaluating');
+      addLog("Meta-System Evaluator is verifying the final output...");
+      console.log("Calling evaluateResult...");
+      const evalResult = await metaAgentService.evaluateResult(task, results, generatedPlan || undefined);
+      console.log("Evaluation received:", evalResult);
+      
+      setEvaluation(evalResult);
+      currentEvaluation = evalResult;
+      addLog(`Quality Score: ${evalResult.score}/10`);
+
+      if (evalResult.isSatisfactory) {
+        addLog("Evaluation successful. Output meets quality standards.");
+      } else {
+        addLog(`Evaluation feedback: ${evalResult.feedback}`);
+        addLog("You can manually refine the system to improve the score.");
+      }
+
+      setCurrentStep('completed');
+      if (generatedPlan) {
+        addLog(`Orchestration of ${generatedPlan.systemName} finished.`);
+        
+        // Initial System Message
+        setChatMessages([
+          { role: 'model', text: `Hello! I am the interface for the **${generatedPlan.systemName}** system. I have completed the task: "${task}". How can I help you further with these results?` }
+        ]);
+      }
+
+    } catch (err: any) {
+      console.error("Orchestration Error:", err);
+      setError(err.message || "An unexpected error occurred during orchestration.");
+      addLog(`ERROR: ${err.message || "Unknown error"}`);
+      setCurrentStep('idle');
     }
   };
 
@@ -524,7 +532,7 @@ export default function App() {
 
               <div className="flex flex-col gap-3">
                 <button
-                  onClick={handleStart}
+                  onClick={() => handleStart(false)}
                   disabled={currentStep !== 'idle' && currentStep !== 'completed' || !task.trim()}
                   className="w-full py-4 bg-white text-black font-bold rounded-xl hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(255,255,255,0.1)]"
                 >
@@ -538,6 +546,15 @@ export default function App() {
                     </>
                   )}
                 </button>
+
+                {currentStep === 'completed' && evaluation && !evaluation.isSatisfactory && (
+                  <button
+                    onClick={() => handleStart(true)}
+                    className="w-full py-3 bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 border border-purple-500/50 font-bold rounded-xl transition-all flex items-center justify-center gap-2 shadow-[0_0_15px_rgba(168,85,247,0.2)]"
+                  >
+                    <RefreshCw className="w-4 h-4" /> Refine & Improve Score
+                  </button>
+                )}
                 
                 {currentStep !== 'idle' && (
                   <button
@@ -550,10 +567,11 @@ export default function App() {
                       setEvaluation(null);
                       setExecutionResults('');
                       setChatMessages([]);
+                      setAttempts(0);
                     }}
                     className="w-full py-3 bg-white/5 text-white/60 hover:text-white hover:bg-white/10 border border-white/10 font-medium rounded-xl transition-all flex items-center justify-center gap-2"
                   >
-                    <RefreshCw className="w-4 h-4" /> Reset System
+                    <X className="w-4 h-4" /> Reset System
                   </button>
                 )}
               </div>
