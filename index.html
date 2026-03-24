@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>My Google AI Studio App</title>
+    <script>
+      (function patchFetch() {
+        try {
+          const originalFetch = window.fetch;
+          if (typeof originalFetch !== 'function') return;
+
+          let currentFetch = originalFetch;
+
+          // Helper to make a property writable on an object using getter/setter
+          function tryPatch(obj) {
+            if (!obj) return false;
+            try {
+              // Try to redefine it with a getter and setter
+              Object.defineProperty(obj, 'fetch', {
+                get() { return currentFetch; },
+                set(v) { 
+                  console.log('window.fetch is being overwritten');
+                  currentFetch = v; 
+                },
+                configurable: true,
+                enumerable: true
+              });
+              return true;
+            } catch (e) {
+              // If redefinition fails, try to delete it first (if configurable)
+              try {
+                delete obj.fetch;
+                Object.defineProperty(obj, 'fetch', {
+                  get() { return currentFetch; },
+                  set(v) { 
+                    console.log('window.fetch is being overwritten (after delete)');
+                    currentFetch = v; 
+                  },
+                  configurable: true,
+                  enumerable: true
+                });
+                return true;
+              } catch (e2) {
+                return false;
+              }
+            }
+          }
+
+          // 1. Try to patch the window instance directly
+          const patchedWindow = tryPatch(window);
+
+          // 2. Try to patch the prototype chain
+          let patchedProto = false;
+          try {
+            let proto = Object.getPrototypeOf(window);
+            while (proto && proto !== Object.prototype) {
+              if (tryPatch(proto)) {
+                patchedProto = true;
+                break;
+              }
+              proto = Object.getPrototypeOf(proto);
+            }
+          } catch (e) {}
+
+          // 3. Try Window.prototype specifically
+          let patchedWindowProto = false;
+          if (typeof Window !== 'undefined' && Window.prototype) {
+            patchedWindowProto = tryPatch(Window.prototype);
+          }
+
+          // 4. Try globalThis
+          let patchedGlobalThis = false;
+          if (typeof globalThis !== 'undefined') {
+            patchedGlobalThis = tryPatch(globalThis);
+          }
+
+          console.log('Fetch patch status:', { 
+            patchedWindow, 
+            patchedProto, 
+            patchedWindowProto, 
+            patchedGlobalThis 
+          });
+        } catch (err) {
+          console.error('Critical error in fetch patch:', err);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

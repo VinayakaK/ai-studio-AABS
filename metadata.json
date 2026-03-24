@@ -1,0 +1,5 @@
+{
+  "name": "Remix: Meta-Agent Orchestrator",
+  "description": "An autonomous agent orchestration system that designs, builds, and executes custom multi-agent systems for any task.",
+  "requestFramePermissions": []
+}
