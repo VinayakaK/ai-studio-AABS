@@ -196,7 +196,7 @@ export default function App() {
     let currentEvaluation: Evaluation | null = null;
     let previousAgents: Agent[] = [];
     let attempts = 0;
-    const maxAttempts = 2; // Allow up to 1 refinement attempt (total 2)
+    const maxAttempts = 5; // Allow up to 5 iterations
 
     while (attempts < maxAttempts) {
       try {
@@ -255,22 +255,36 @@ export default function App() {
         
         let results = "";
         const currentExecutionAgents: Agent[] = initializedAgents.map(a => ({ ...a }));
-        const completedAgentIds = new Set<string>();
         const runningAgentIds = new Set<string>();
         const agentResults: Record<string, string> = {};
 
         const executeDAG = async () => {
-          while (completedAgentIds.size < currentExecutionAgents.length) {
-            // Find agents that are pending and have all dependencies met
+          let stalled = false;
+          while (currentExecutionAgents.some(a => a.status === 'pending') && !stalled) {
+            // Find agents that are pending and have all dependencies met (status === 'completed')
             const readyAgents = currentExecutionAgents.filter(agent => 
               agent.status === 'pending' && 
-              (!agent.dependencies || agent.dependencies.every(depId => completedAgentIds.has(depId))) &&
+              (!agent.dependencies || agent.dependencies.every(depId => {
+                const dep = currentExecutionAgents.find(a => a.id === depId);
+                return dep && dep.status === 'completed';
+              })) &&
               !runningAgentIds.has(agent.id)
             );
 
             if (readyAgents.length === 0 && runningAgentIds.size === 0) {
-              // This could happen if there's a circular dependency or a dead-end
-              throw new Error("Execution stalled: Circular dependencies or unmet prerequisites detected.");
+              // No agents are ready and none are running.
+              // This means either circular dependency, or some dependencies failed.
+              // Mark remaining pending agents as failed.
+              currentExecutionAgents.forEach(a => {
+                if (a.status === 'pending') {
+                  a.status = 'failed';
+                  a.result = 'Skipped due to failed dependencies or circular dependency.';
+                }
+              });
+              setAgents([...currentExecutionAgents]);
+              addLog("Execution stalled: Some agents were skipped due to failed prerequisites.");
+              stalled = true;
+              break;
             }
 
             if (readyAgents.length > 0) {
@@ -304,21 +318,41 @@ export default function App() {
                       .join("");
                   }
 
-                  const result = await metaAgentService.executeAgent(agent, task, context, priority, currentEvaluation || undefined);
+                  const agentOutput = await metaAgentService.executeAgent(agent, task, context, priority, currentEvaluation || undefined);
                   
-                  agentResults[agent.id] = result;
-                  completedAgentIds.add(agent.id);
+                  agentResults[agent.id] = agentOutput.output;
                   runningAgentIds.delete(agent.id);
                   
                   // Update the local agent object in our tracking array
                   const agentIdx = currentExecutionAgents.findIndex(a => a.id === agent.id);
                   if (agentIdx !== -1) {
-                    currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'completed', result };
+                    currentExecutionAgents[agentIdx] = { 
+                      ...currentExecutionAgents[agentIdx], 
+                      status: agentOutput.status === 'failed' ? 'failed' : 'completed', 
+                      result: agentOutput.output,
+                      structuredOutput: agentOutput
+                    };
                   }
 
-                  setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'completed', result } : a));
-                  addLog(`[${agent.name}] task completed successfully.`);
+                  setAgents(prev => prev.map(a => a.id === agent.id ? { 
+                    ...a, 
+                    status: agentOutput.status === 'failed' ? 'failed' : 'completed', 
+                    result: agentOutput.output,
+                    structuredOutput: agentOutput 
+                  } : a));
+                  addLog(`[${agent.name}] task ${agentOutput.status === 'failed' ? 'failed' : 'completed successfully'} with confidence ${agentOutput.confidence}%.`);
+                  
+                  if (agentOutput.status === 'failed') {
+                    // Call diagnoseFailure to get detailed context
+                    const diagnosis = await metaAgentService.diagnoseFailure(agent, agentOutput.output, task, currentExecutionAgents);
+                    if (agentIdx !== -1) {
+                      currentExecutionAgents[agentIdx].failureDiagnosis = diagnosis;
+                    }
+                    setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, failureDiagnosis: diagnosis } : a));
+                    addLog(`[${agent.name}] FAILED. Diagnosis generated.`);
+                  }
                 } catch (agentErr: any) {
+                  runningAgentIds.delete(agent.id);
                   const agentIdx = currentExecutionAgents.findIndex(a => a.id === agent.id);
                   const errorMsg = agentErr.message || "Unknown error";
                   
@@ -326,11 +360,10 @@ export default function App() {
                   const diagnosis = await metaAgentService.diagnoseFailure(agent, errorMsg, task, currentExecutionAgents);
                   
                   if (agentIdx !== -1) {
-                    currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'failed', failureDiagnosis: diagnosis };
+                    currentExecutionAgents[agentIdx] = { ...currentExecutionAgents[agentIdx], status: 'failed', failureDiagnosis: diagnosis, result: errorMsg };
                   }
-                  setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'failed', failureDiagnosis: diagnosis } : a));
-                  addLog(`[${agent.name}] FAILED. Diagnosis generated.`);
-                  throw agentErr;
+                  setAgents(prev => prev.map(a => a.id === agent.id ? { ...a, status: 'failed', failureDiagnosis: diagnosis, result: errorMsg } : a));
+                  addLog(`[${agent.name}] FAILED with error. Diagnosis generated.`);
                 }
               });
 
@@ -347,8 +380,8 @@ export default function App() {
         
         // Build final results string from all agents in the order they were defined in the plan
         results = currentExecutionAgents
-          .filter(a => a.status === 'completed')
-          .map(a => `\n--- Result from ${a.name} ---\n${a.result}\n`)
+          .filter(a => a.status === 'completed' || a.status === 'failed')
+          .map(a => `\n--- Result from ${a.name} ---\nStatus: ${a.structuredOutput?.status || a.status}\nOutput: ${a.result}\nNext Action: ${a.structuredOutput?.next_action || 'N/A'}\nConfidence: ${a.structuredOutput?.confidence || 0}%\n`)
           .join("");
         
         setExecutionResults(results);
@@ -362,31 +395,35 @@ export default function App() {
         
         setEvaluation(evalResult);
         currentEvaluation = evalResult;
-        addLog(`Quality Score: ${evalResult.score}/10`);
+        addLog(`Quality Score: ${evalResult.score}/100`);
 
-        if (evalResult.isSatisfactory) {
-          addLog("Evaluation successful. Output meets quality standards.");
+        if (evalResult.decision === 'terminate') {
+          addLog("Evaluation successful. Output meets quality standards or cannot be improved further.");
           break; // Exit loop if satisfactory
-        } else if (attempts < maxAttempts) {
-          setCurrentStep('improving');
-          addLog(`Evaluation failed: ${evalResult.feedback}`);
-          addLog("Agents are reflecting on their performance...");
-          
-          const reflectingAgents = [...currentExecutionAgents];
-          for (let i = 0; i < reflectingAgents.length; i++) {
-            const agent = reflectingAgents[i];
-            addLog(`[${agent.name}] is analyzing feedback...`);
-            const learning = await metaAgentService.agentSelfReflect(agent, task, evalResult);
-            reflectingAgents[i] = { ...agent, learning_from_feedback: learning };
-            addLog(`[${agent.name}] Learning: ${learning}`);
-          }
-          previousAgents = reflectingAgents;
-          setAgents(reflectingAgents);
+        } else if (evalResult.decision === 'refine' || evalResult.decision === 'continue') {
+          if (attempts < maxAttempts) {
+            setCurrentStep('improving');
+            addLog(`Evaluation feedback: ${evalResult.feedback}`);
+            addLog("Agents are reflecting on their performance...");
+            
+            const reflectingAgents = [...currentExecutionAgents];
+            for (let i = 0; i < reflectingAgents.length; i++) {
+              const agent = reflectingAgents[i];
+              if (agent.status === 'completed' || agent.status === 'failed') {
+                addLog(`[${agent.name}] is analyzing feedback...`);
+                const learning = await metaAgentService.agentSelfReflect(agent, task, evalResult);
+                reflectingAgents[i] = { ...agent, learning_from_feedback: learning };
+                addLog(`[${agent.name}] Learning: ${learning}`);
+              }
+            }
+            previousAgents = reflectingAgents;
+            setAgents(reflectingAgents);
 
-          addLog("Triggering self-improvement loop with agent learnings...");
-          await new Promise(r => setTimeout(r, 3000));
-        } else {
-          addLog("Max refinement attempts reached. Delivering best possible output.");
+            addLog("Triggering self-improvement loop with agent learnings...");
+            await new Promise(r => setTimeout(r, 3000));
+          } else {
+            addLog("Max refinement attempts reached. Delivering best possible output.");
+          }
         }
 
       } catch (err: any) {
@@ -768,6 +805,21 @@ export default function App() {
                                 </div>
                               </div>
                             )}
+                            {a.dependencies && a.dependencies.length > 0 && (
+                              <div>
+                                <p className="text-[9px] text-gray-600 uppercase tracking-widest font-bold mb-1">Depends On</p>
+                                <div className="flex flex-wrap gap-1">
+                                  {a.dependencies.map((depId, di) => {
+                                    const depAgent = agents.find(ag => ag.id === depId);
+                                    return (
+                                      <span key={di} className="px-2 py-0.5 bg-blue-500/10 border border-blue-500/20 rounded-md text-[9px] text-blue-300 flex items-center gap-1">
+                                        <ChevronRight className="w-2 h-2" /> {depAgent?.name || depId}
+                                      </span>
+                                    );
+                                  })}
+                                </div>
+                              </div>
+                            )}
                           </div>
                           {status !== 'pending' && (
                             <div className="mt-3 pt-3 border-t border-white/5 flex items-center justify-between">
@@ -807,16 +859,16 @@ export default function App() {
                       </h3>
                       <div className="flex items-center gap-2 bg-black/40 px-4 py-2 rounded-2xl border border-white/10">
                         <span className="text-3xl font-black text-white">{evaluation.score}</span>
-                        <span className="text-gray-500 text-sm">/ 10</span>
+                        <span className="text-gray-500 text-sm">/ 100</span>
                       </div>
                     </div>
                     <p className="text-gray-300 mb-6 leading-relaxed">
                       {evaluation.feedback}
                     </p>
                     <div className={`inline-flex items-center gap-2 px-4 py-2 rounded-full text-xs font-bold uppercase tracking-widest ${
-                      evaluation.isSatisfactory ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
+                      evaluation.decision === 'terminate' ? 'bg-green-500/20 text-green-400 border border-green-500/30' : 'bg-red-500/20 text-red-400 border border-red-500/30'
                     }`}>
-                      {evaluation.isSatisfactory ? 'Satisfactory Delivery' : 'Refinement Required'}
+                      {evaluation.decision === 'terminate' ? 'Satisfactory Delivery' : 'Refinement Required'}
                     </div>
                   </div>
 

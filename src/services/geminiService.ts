@@ -1,7 +1,3 @@
-import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
-
 export enum TaskComplexity {
   SIMPLE = "SIMPLE",
   MEDIUM = "MEDIUM",
@@ -14,6 +10,14 @@ export enum Priority {
   HIGH = "HIGH",
 }
 
+export interface AgentOutput {
+  agent_name: string;
+  status: 'success' | 'failed' | 'partial';
+  output: string;
+  next_action: string;
+  confidence: number;
+}
+
 export interface Agent {
   id: string;
   name: string;
@@ -23,8 +27,10 @@ export interface Agent {
   tools?: string[];
   dependencies?: string[]; // IDs of agents that must complete before this one starts
   load?: number; // Load percentage (0-100)
+  timeout?: number; // Timeout in milliseconds
   status: 'pending' | 'running' | 'completed' | 'failed';
   result?: string;
+  structuredOutput?: AgentOutput;
   learning_from_feedback?: string;
   failureDiagnosis?: string;
 }
@@ -38,9 +44,25 @@ export interface Plan {
 }
 
 export interface Evaluation {
-  score: number;
+  score: number; // 0-100
   feedback: string;
-  isSatisfactory: boolean;
+  decision: 'continue' | 'refine' | 'terminate';
+}
+
+async function apiCall(endpoint: string, payload: any): Promise<string> {
+  const response = await fetch(`/api/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || `API error: ${response.statusText}`);
+  }
+  
+  const data = await response.json();
+  return data.text;
 }
 
 export class MetaAgentService {
@@ -96,9 +118,7 @@ export class MetaAgentService {
       : "";
 
     try {
-      const responsePromise = this.withRetry(() => ai.models.generateContent({
-        model: this.model,
-        contents: `You are a Meta-System Architect. Your task is to design a custom multi-agent system (a "mini-system") specifically tailored to solve this user request: "${task}".
+      const prompt = `You are a Meta-System Architect. Your task is to design a custom multi-agent system (a "mini-system") specifically tailored to solve this user request: "${task}".
         Task Priority: ${priority}
         ${skillsContext}
         ${toolsContext}
@@ -123,6 +143,18 @@ export class MetaAgentService {
            - **Tools**: Assign appropriate tools like 'Python/Node.js execution environment', 'API interaction libraries', or 'System command utilities'.
            - Ensure its dependencies and load are correctly configured according to the AGENT BUILDING SKILLS GUIDE.
            - Ensure the "expectedOutput" for each agent is clear and specifies a structured format (e.g., Markdown table, list, or JSON snippet) to ensure reliability.
+           - **WEB_SEARCHER Agent**: Include a 'WEB_SEARCHER' agent type when the task requires up-to-date, real-time information from the web. 
+             - **Role**: Real-Time Information Retrieval.
+             - **Objective**: Fetch current data, news, or facts from the web using Google Search to provide context for other agents.
+             - **Expected Output**: A structured summary of the search results with sources.
+             - **Tools**: MUST include 'googleSearch'.
+             - Ensure it is set as a dependency for any DATA_FETCHER, ANALYZER, or other agents that rely on current information.
+             - Set an appropriate timeout (e.g., 60000 ms) for this agent to prevent hanging on slow searches.
+           - **ANALYZER Agent**: Include an 'ANALYZER' agent type when the task requires data analysis, synthesis, or evaluation.
+             - **Role**: Data Analysis & Synthesis.
+             - **Objective**: Analyze provided data or context, leveraging real-time information from the web when necessary for accurate analysis. You MUST always fetch real-time info to ensure accuracy and NEVER provide fake, hallucinated, or false information.
+             - **Expected Output**: Analytical reports, insights, or synthesized data summaries.
+             - **Tools**: MUST include 'googleSearch' to verify and enrich analysis with real-time data.
         
         6. **Dynamic Tool Discovery & Assignment**:
            - For each agent, proactively discover and suggest a set of relevant tools.
@@ -135,7 +167,7 @@ export class MetaAgentService {
         7. **Agent Dependencies**: Define explicit dependencies between agents. Some agents may need to complete their tasks before others can start. Specify these dependencies using agent IDs (e.g., agent 'A' must complete before agent 'B' can start). This will allow for a Directed Acyclic Graph (DAG) execution strategy.
         
         ${previousEvaluation ? `PREVIOUS EVALUATION FEEDBACK (LEARN FROM THIS):
-        Score: ${previousEvaluation.score}/10
+        Score: ${previousEvaluation.score}/100
         Feedback: ${previousEvaluation.feedback}
         Please adjust the system architecture and agent objectives to address this feedback.` : ""}
 
@@ -143,54 +175,35 @@ export class MetaAgentService {
         ${agentLearnings}
         Use these specific agent insights to improve the next system design.` : ""}
 
-        The priority "${priority}" should influence the depth of research, the number of agents (higher priority might need more specialized agents), and the overall thoroughness of the design.`,
-        config: {
-          systemInstruction: "You are a Meta-System Architect. Your task is to design a custom multi-agent system (a 'mini-system') specifically tailored to solve a user request. You must return your design in a strictly valid JSON format following the provided schema. Ensure each agent has a clear role, a structured 'expectedOutput' format, and a list of tools they should use. The 'reasoning' field must contain a thorough justification of your design choices, including agent selection, complexity, and conflict resolution.",
-          responseMimeType: "application/json",
-          tools: [{ googleSearch: {} }],
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              systemName: { type: Type.STRING },
-              systemDescription: { type: Type.STRING },
-              complexity: { type: Type.STRING, enum: Object.values(TaskComplexity) },
-              reasoning: { type: Type.STRING },
-              agents: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    name: { type: Type.STRING },
-                    role: { type: Type.STRING },
-                    objective: { type: Type.STRING },
-                    expectedOutput: { type: Type.STRING },
-                    tools: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING }
-                    },
-                    dependencies: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING },
-                      description: "List of agent IDs that this agent depends on."
-                    },
-                    load: {
-                      type: Type.NUMBER,
-                      description: "Load percentage (0-100) for this agent."
-                    }
-                  },
-                  required: ["id", "name", "role", "objective", "expectedOutput"],
-                },
-              },
-            },
-            required: ["systemName", "systemDescription", "complexity", "reasoning", "agents"],
-          },
-        },
-      }));
+        The priority "${priority}" should influence the depth of research, the number of agents (higher priority might need more specialized agents), and the overall thoroughness of the design.
+        
+        Return the result as a JSON object with the following structure:
+        {
+          "systemName": "string",
+          "systemDescription": "string",
+          "complexity": "SIMPLE" | "MEDIUM" | "COMPLEX",
+          "reasoning": "string",
+          "agents": [
+            {
+              "id": "string",
+              "name": "string",
+              "role": "string",
+              "objective": "string",
+              "expectedOutput": "string",
+              "tools": ["string"],
+              "dependencies": ["string"],
+              "load": number,
+              "timeout": number
+            }
+          ]
+        }`;
 
-      const response = await Promise.race([responsePromise, timeoutPromise]);
+      const systemInstruction = "You are a Meta-System Architect. Your task is to design a custom multi-agent system (a 'mini-system') specifically tailored to solve a user request. You must return your design in a strictly valid JSON format following the provided schema. Ensure each agent has a clear role, a structured 'expectedOutput' format, and a list of tools they should use. The 'reasoning' field must contain a thorough justification of your design choices, including agent selection, complexity, and conflict resolution.";
 
-      const text = response.text;
+      const responsePromise = this.withRetry(() => apiCall("generatePlan", { prompt, systemInstruction }));
+      
+      const text = await Promise.race([responsePromise, timeoutPromise]);
+
       if (!text) {
         throw new Error("Model returned an empty response during planning.");
       }
@@ -217,9 +230,7 @@ export class MetaAgentService {
     console.log(`Proactively discovering tools for system: ${plan.systemName}`);
     
     try {
-      const response = await this.withRetry(() => ai.models.generateContent({
-        model: this.model,
-        contents: `You are the Meta-System Architect. You have already designed the following multi-agent system for the task: "${task}".
+      const prompt = `You are the Meta-System Architect. You have already designed the following multi-agent system for the task: "${task}".
         
         SYSTEM DESIGN:
         Name: ${plan.systemName}
@@ -235,52 +246,14 @@ export class MetaAgentService {
         2. **Use Google Search** to find real-world, specific tools, libraries, or APIs that fit these categories (e.g., specific Python libraries, specialized APIs, visualization frameworks).
         3. For each agent, provide a list of 2-4 highly relevant tools.
         4. Update the 'tools' field for each agent in the provided plan.
+        5. Preserve the 'timeout' field for each agent if it exists.
         
-        Return the updated plan in JSON format.`,
-        config: {
-          systemInstruction: "You are a Meta-System Architect specialized in tool discovery. Use Google Search to find the most relevant and powerful tools for your agents. Return the updated plan in a strictly valid JSON format.",
-          responseMimeType: "application/json",
-          tools: [{ googleSearch: {} }],
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              systemName: { type: Type.STRING },
-              systemDescription: { type: Type.STRING },
-              complexity: { type: Type.STRING, enum: Object.values(TaskComplexity) },
-              reasoning: { type: Type.STRING },
-              agents: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    name: { type: Type.STRING },
-                    role: { type: Type.STRING },
-                    objective: { type: Type.STRING },
-                    expectedOutput: { type: Type.STRING },
-                    tools: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING }
-                    },
-                    dependencies: {
-                      type: Type.ARRAY,
-                      items: { type: Type.STRING }
-                    },
-                    load: {
-                      type: Type.NUMBER,
-                      description: "Load percentage (0-100) for this agent."
-                    }
-                  },
-                  required: ["id", "name", "role", "objective", "expectedOutput"],
-                },
-              },
-            },
-            required: ["systemName", "systemDescription", "complexity", "reasoning", "agents"],
-          },
-        },
-      }));
+        Return the updated plan in JSON format.`;
 
-      const text = response.text;
+      const systemInstruction = "You are a Meta-System Architect specialized in tool discovery. Use Google Search to find the most relevant and powerful tools for your agents. Return the updated plan in a strictly valid JSON format.";
+
+      const text = await this.withRetry(() => apiCall("discoverTools", { prompt, systemInstruction }));
+      
       if (!text) throw new Error("Tool discovery returned empty response.");
       
       const updatedPlan = JSON.parse(text) as Plan;
@@ -292,7 +265,7 @@ export class MetaAgentService {
     }
   }
 
-  async executeAgent(agent: Agent, task: string, previousResults: string, priority: Priority = Priority.MEDIUM, previousEvaluation?: Evaluation): Promise<string> {
+  async executeAgent(agent: Agent, task: string, previousResults: string, priority: Priority = Priority.MEDIUM, previousEvaluation?: Evaluation): Promise<AgentOutput> {
     console.log(`Executing agent: ${agent.name} with priority: ${priority}`);
     if (previousEvaluation) {
       console.log(`Agent ${agent.name} is learning from previous evaluation feedback.`);
@@ -303,24 +276,25 @@ export class MetaAgentService {
       ? previousResults.substring(previousResults.length - maxContextLength) + "... [truncated]"
       : previousResults;
 
-    const timeout = 120000; // 120 seconds timeout per agent
+    const timeout = agent.timeout || 120000; // Use agent specific timeout or default to 120 seconds
     const timeoutPromise = new Promise<never>((_, reject) => 
-      setTimeout(() => reject(new Error(`Agent ${agent.name} timed out. The task might be too complex.`)), timeout)
+      setTimeout(() => reject(new Error(`Agent ${agent.name} timed out after ${timeout}ms. The task might be too complex.`)), timeout)
     );
 
     try {
-      const responsePromise = this.withRetry(() => ai.models.generateContent({
-        model: this.flashModel,
-        contents: `You are an autonomous agent named "${agent.name}".
+      const prompt = `You are an autonomous agent named "${agent.name}".
         Your Role: ${agent.role}
         Your Objective: ${agent.objective}
         Your Assigned Tools: ${agent.tools?.join(', ') || 'General AI Capabilities'}
         Expected Output: ${agent.expectedOutput}
+        ${agent.learning_from_feedback ? `\n        YOUR PREVIOUS LEARNING/STRATEGY ADJUSTMENT:\n        ${agent.learning_from_feedback}\n        Apply this learning to improve your execution this time.` : ""}
         
         Context of the overall task: "${task}"
         Task Priority: ${priority}
         Previous agents' results:
         ${truncatedResults}
+        
+        ${agent.tools?.includes('googleSearch') ? `CRITICAL INSTRUCTION: You have access to 'googleSearch'. You MUST use it to fetch real-time, up-to-date information to complete your objective. NEVER hallucinate, guess, or provide fake/false information. If you cannot find the information, state that clearly.` : ""}
         
         ${previousEvaluation ? `PREVIOUS SYSTEM EVALUATION FEEDBACK:
         Feedback: ${previousEvaluation.feedback}
@@ -328,21 +302,32 @@ export class MetaAgentService {
 
         Please execute your task and provide the result. 
         
-        CRITICAL: Your output must be visually attractive and well-structured. 
+        CRITICAL: You MUST return your output in the following JSON structure:
+        {
+          "agent_name": "${agent.name}",
+          "status": "success" | "failed" | "partial",
+          "output": "Your detailed markdown-formatted result here...",
+          "next_action": "What should happen next or what is missing",
+          "confidence": 0-100
+        }
+        
+        Make sure the "output" field contains visually attractive and well-structured Markdown.
         - Use Markdown extensively: Headings (###), Bullet points, Numbered lists, Bold text, and Tables where appropriate.
-        - DO NOT return raw JSON unless the "Expected Output" explicitly requires it for a technical reason.
         - Organize your findings into clear sections with descriptive headers.
         - Ensure your response is concise but comprehensive.
         
-        The priority is "${priority}". Adjust your effort and detail level accordingly. High priority tasks require maximum depth and precision.`,
-        config: {
-          systemInstruction: "You are a highly reliable autonomous agent. Your output must be well-structured using Markdown (headings, lists, bold text, tables). Avoid raw JSON unless strictly necessary. Do not include conversational filler like 'Sure, I can help with that'. Focus only on the task result.",
-          maxOutputTokens: 2048,
-        },
-      }));
+        The priority is "${priority}". Adjust your effort and detail level accordingly. High priority tasks require maximum depth and precision.`;
 
-      const response = await Promise.race([responsePromise, timeoutPromise]);
-      const result = (response.text || "No output generated.").trim();
+      const systemInstruction = "You are a highly reliable autonomous agent. You MUST return a strictly valid JSON object matching the requested schema. The 'output' field inside the JSON should contain your detailed Markdown response.";
+
+      const responsePromise = this.withRetry(() => apiCall("executeAgent", { prompt, systemInstruction, tools: agent.tools }));
+
+      const text = await Promise.race([responsePromise, timeoutPromise]);
+      if (!text) {
+        throw new Error("Model returned an empty response during execution.");
+      }
+      
+      const result = JSON.parse(text) as AgentOutput;
       console.log(`Agent ${agent.name} execution complete.`);
       return result;
     } catch (error) {
@@ -355,26 +340,23 @@ export class MetaAgentService {
     console.log(`Agent ${agent.name} is reflecting on feedback...`);
     
     try {
-      const response = await ai.models.generateContent({
-        model: this.flashModel,
-        contents: `You are an autonomous agent named "${agent.name}".
+      const prompt = `You are an autonomous agent named "${agent.name}".
         Your Role: ${agent.role}
         Your Objective: ${agent.objective}
         Your Previous Result: ${agent.result || "No result (failed)"}
         
         The overall system evaluation was:
-        Score: ${evaluation.score}/10
+        Score: ${evaluation.score}/100
         Feedback: ${evaluation.feedback}
         
         Reflect on your performance. Why did the system fail to meet expectations? What could you have done better in your specific role? 
-        Provide a concise "learning" or "strategy adjustment" for your future self. Focus on technical improvements or objective refinements.`,
-        config: {
-          systemInstruction: "You are a self-improving autonomous agent. Analyze feedback and provide a concise technical learning or strategy adjustment. Do not be conversational.",
-          maxOutputTokens: 512,
-        },
-      });
+        Provide a concise "learning" or "strategy adjustment" for your future self. Focus on technical improvements or objective refinements.`;
 
-      return response.text || "No learning generated.";
+      const systemInstruction = "You are a self-improving autonomous agent. Analyze feedback and provide a concise technical learning or strategy adjustment. Do not be conversational.";
+
+      const text = await this.withRetry(() => apiCall("agentSelfReflect", { prompt, systemInstruction }));
+
+      return text || "No learning generated.";
     } catch (error) {
       console.error(`Error in agentSelfReflect for ${agent.name}:`, error);
       return "Failed to generate learning from feedback.";
@@ -387,9 +369,7 @@ export class MetaAgentService {
     const agentStates = allAgents.map(a => `- ${a.name} (${a.role}): ${a.status}`).join('\n');
 
     try {
-      const response = await this.withRetry(() => ai.models.generateContent({
-        model: this.flashModel,
-        contents: `You are a System Diagnostic AI. An autonomous agent in a multi-agent system has failed.
+      const prompt = `You are a System Diagnostic AI. An autonomous agent in a multi-agent system has failed.
         
         Failed Agent: "${agent.name}"
         Role: ${agent.role}
@@ -407,14 +387,13 @@ export class MetaAgentService {
         3. Suggest 2-3 potential root causes.
         4. Recommend a specific fix or adjustment to the agent's objective or tools.
         
-        Format your response as a concise Markdown report.`,
-        config: {
-          systemInstruction: "You are a System Diagnostic AI. Provide clear, technical, and actionable failure analysis for multi-agent systems.",
-          maxOutputTokens: 1024,
-        },
-      }));
+        Format your response as a concise Markdown report.`;
 
-      return response.text || "Failed to generate diagnosis.";
+      const systemInstruction = "You are a System Diagnostic AI. Provide clear, technical, and actionable failure analysis for multi-agent systems.";
+
+      const text = await this.withRetry(() => apiCall("diagnoseFailure", { prompt, systemInstruction }));
+
+      return text || "Failed to generate diagnosis.";
     } catch (err) {
       console.error(`Error in diagnoseFailure for ${agent.name}:`, err);
       return `Diagnosis failed. Original error: ${error}`;
@@ -440,9 +419,7 @@ export class MetaAgentService {
     );
 
     try {
-      const responsePromise = this.withRetry(() => ai.models.generateContent({
-        model: this.flashModel,
-        contents: `You are a Senior System Evaluator AI. Your task is to perform a rigorous quality audit of the final output generated by a multi-agent system.
+      const prompt = `You are a Senior System Evaluator AI. Your task is to perform a rigorous quality audit of the final output generated by a multi-agent system.
 
         USER ORIGINAL TASK: "${task}"
         ${agentsContext}
@@ -456,32 +433,26 @@ export class MetaAgentService {
         3. **Accuracy & Technical Depth**: Is the information factually correct and sufficiently detailed for the task complexity?
         4. **Structural Integrity**: Is the output well-formatted (Markdown, tables, etc.) and easy to consume?
 
-        SCORING RUBRIC (0-10):
-        - 0-3: CRITICAL FAILURE. Missing core components, highly inaccurate, or ignored the user task.
-        - 4-6: PARTIAL SUCCESS. Met basic requirements but lacks depth, has minor inaccuracies, or failed specific agent objectives.
-        - 7-8: HIGH QUALITY. Meets all core objectives, accurate, and well-structured.
-        - 9-10: EXCEPTIONAL. Exceeds expectations, perfect alignment with architecture, and provides deep insights.
+        SCORING RUBRIC (0-100):
+        - 0-30: CRITICAL FAILURE. Missing core components, highly inaccurate, or ignored the user task.
+        - 31-60: PARTIAL SUCCESS. Met basic requirements but lacks depth, has minor inaccuracies, or failed specific agent objectives.
+        - 61-85: HIGH QUALITY. Meets all core objectives, accurate, and well-structured.
+        - 86-100: EXCEPTIONAL. Exceeds expectations, perfect alignment with architecture, and provides deep insights.
 
-        Your feedback must be technical and constructive. If the score is below 8, explicitly state what is missing or what needs improvement for the next refinement iteration.
+        DECISION LOGIC:
+        - "terminate": The score is 86-100 (Exceptional) OR the task is completely impossible to improve further.
+        - "refine": The score is 31-85 and can be improved with another iteration.
+        - "continue": The score is 0-30 and the system should try a completely different approach or continue the loop.
 
-        Return in JSON format.`,
-        config: {
-          systemInstruction: "You are a Senior System Evaluator AI. Provide a rigorous, objective, and technical evaluation of the system output. Return your audit in a strictly valid JSON format.",
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              score: { type: Type.NUMBER },
-              feedback: { type: Type.STRING },
-              isSatisfactory: { type: Type.BOOLEAN },
-            },
-            required: ["score", "feedback", "isSatisfactory"],
-          },
-        },
-      }));
+        Your feedback must be technical and constructive. Explicitly state what is missing or what needs improvement for the next refinement iteration.
 
-      const response = await Promise.race([responsePromise, timeoutPromise]);
-      const text = response.text;
+        Return in JSON format.`;
+
+      const systemInstruction = "You are a Senior System Evaluator AI. Provide a rigorous, objective, and technical evaluation of the system output. Return your audit in a strictly valid JSON format.";
+
+      const responsePromise = this.withRetry(() => apiCall("evaluateResult", { prompt, systemInstruction }));
+
+      const text = await Promise.race([responsePromise, timeoutPromise]);
       if (!text) {
         throw new Error("Model returned an empty response during evaluation.");
       }
@@ -514,11 +485,7 @@ export class MetaAgentService {
     const recentHistory = chatHistory.slice(-10);
 
     try {
-      const response = await ai.models.generateContent({
-        model: this.flashModel,
-        contents: [
-          {
-            text: `You are the interface for a custom AI system named "${plan.systemName}".
+      const prompt = `You are the interface for a custom AI system named "${plan.systemName}".
             
             System Context:
             - Original Task: "${task}"
@@ -532,16 +499,13 @@ export class MetaAgentService {
             Chat History:
             ${recentHistory.map(h => `${h.role === 'user' ? 'User' : 'System'}: ${h.text}`).join('\n')}
             
-            User: ${userMessage}`
-          }
-        ],
-        config: {
-          systemInstruction: `You are the interface for a custom AI system named "${plan.systemName}". You must respond as the collective intelligence of this system. Answer the user's questions about the results, provide more details, or perform further analysis based on the existing data. Use Markdown for formatting (headings, lists, bold text, tables) to make your output reliable and easy to read.`,
-          maxOutputTokens: 2048,
-        },
-      });
+            User: ${userMessage}`;
 
-      return response.text || "I'm sorry, I couldn't generate a response.";
+      const systemInstruction = `You are the interface for a custom AI system named "${plan.systemName}". You must respond as the collective intelligence of this system. Answer the user's questions about the results, provide more details, or perform further analysis based on the existing data. Use Markdown for formatting (headings, lists, bold text, tables) to make your output reliable and easy to read.`;
+
+      const text = await this.withRetry(() => apiCall("chatWithSystem", { prompt, systemInstruction }));
+
+      return text || "I'm sorry, I couldn't generate a response.";
     } catch (error) {
       console.error("Error in chatWithSystem:", error);
       throw error;
